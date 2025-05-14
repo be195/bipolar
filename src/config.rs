@@ -1,93 +1,143 @@
 use serde::{Serialize, Deserialize};
-use std::{fs::File, io::{Read, Write}};
+use std::{fs::File, io::{Read, Write}, collections::HashMap};
 use git2::Repository;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ExperimentConfig {
-  pub name: String,
-  pub repo: String,
-  pub base: String,
-  pub treatments: Vec<Treatment>,
-  pub trigger: Trigger,
+    pub name: String,
+    pub repo: String,
+    pub base: String,
+    pub treatments: Vec<Treatment>,
+    pub assignment: Assignment,
+
+    // if we have multiple servers, we can configure each instance of
+    // bipolar to have a minimum and maximum number of shards, but the
+    // shard count is always the same for all instances
+    pub shard_count: u16,
+    pub minmax: (u8, u8),
+}
+
+// for web apps. assigned on runtime by using client IP address
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProxyAssignment {}
+
+// assigned on build time
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RandomAssignment {
+    pub seed: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct Treatment {
-  pub name: String,
-  pub ref_field: Option<String>,
-  pub commit: Option<String>,
-  pub patch: Option<String>,
+pub enum AssignmentType {
+    Proxy(ProxyAssignment),
+    Random(RandomAssignment),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag="type")]
-pub enum Trigger {
-  #[serde(rename="hash_mod")]
-  HashMod {
-    key: String,
-    modulus: u32,
-    threshold: u32,
-  }
+pub struct Assignment {
+    pub split: HashMap<String, u8>,
+    pub conf: AssignmentType,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag="type")]
-pub enum Config {
-  #[serde(rename="experiment")]
-  Experiment(ExperimentConfig),
+pub struct BranchTreatment {
+    pub name: String,
+    pub ref_field: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CommitTreatment {
+    pub name: String,
+    pub commit: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PatchTreatment {
+    pub name: String,
+    pub patch: String,
+    pub base: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum Treatment {
+    Branch(BranchTreatment),
+    Commit(CommitTreatment),
+    Patch(PatchTreatment),
 }
 
 const CONFIG_FILE: &str = "bipolar.toml";
 
-pub fn load_config() -> Result<ExperimentConfig, Box<dyn std::error::Error>> {
-  let mut file = File::open(CONFIG_FILE)?;
+pub fn get_config_path() -> Result<String, Box<dyn std::error::Error>> {
+    let repo = Repository::discover(".")?;
 
-  let mut contents = String::new();
-  let _ = file.read_to_string(&mut contents);
+    let mut path = repo.path().to_path_buf();
+    path.pop();
+    path.push(CONFIG_FILE);
 
-  let config = toml::from_str(&contents)?;
-
-  Ok(config)
+    Ok(path.to_str().unwrap_or("unknown").to_string())
 }
 
+pub fn load_config() -> Result<ExperimentConfig, Box<dyn std::error::Error>> {
+    let path = get_config_path()?;
+    let mut file = File::open(path)?;
+
+    let mut contents = String::new();
+    let _ = file.read_to_string(&mut contents);
+
+    let config = toml::from_str(&contents)?;
+
+    Ok(config)
+}
 
 pub fn init_config(name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-  let repo = match Repository::discover(".") {
-    Ok(repo) => repo,
-    Err(_) => Err("couldn't find git repository")?,
-  };
+    let repo = Repository::discover(".")?;
 
-  let origin = match repo.find_remote("origin") {
-    Ok(origin) => origin,
-    Err(_) => Err("couldn't find remote origin")?,
-  };
-  let url = origin.url().expect("couldn't get remote url");
-  let repo_name = url.split("/").last().unwrap_or("unknown_repo").to_string();
+    let origin = repo.find_remote("origin")?;
+    let url = origin.url().expect("couldn't get remote url");
+    let repo_name = url.split("/").last().unwrap_or("unknown_repo").to_string();
 
-  let commit = repo.head().expect("couldn't get HEAD commit")
-    .peel_to_commit().expect("couldn't peel to commit");
-  let base = commit.id().to_string();
+    let commit = repo.head().expect("couldn't get HEAD commit")
+        .peel_to_commit().expect("couldn't peel to commit");
+    let base = commit.id().to_string();
 
-  let config = ExperimentConfig {
-    name: name.unwrap_or(repo_name),
-    repo: url.to_string(),
-    base,
-    treatments: vec![],
-    trigger: Trigger::HashMod {
-      key: "default".to_string(),
-      modulus: 1,
-      threshold: 0,
-    },
-  };
+    let config = ExperimentConfig {
+        name: name.unwrap_or(repo_name),
+        repo: url.to_string(),
+        base,
+        treatments: vec![],
+        assignment: Assignment {
+            split: HashMap::new(),
+            conf: AssignmentType::Random(RandomAssignment { seed: 0 }),
+        },
+        shard_count: 1,
+        minmax: (0, 0),
+    };
 
-  let toml_string = toml::to_string(&config).expect("couldn't serialize config");
-  let mut file = match File::create(CONFIG_FILE) {
-    Ok(file) => file,
-    Err(e) => Err(format!("couldn't create config file: {}", e))?,
-  };
+    match save_config(&config) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("couldn't save config: {}", e))?,
+    }
+}
 
-  match file.write_all(toml_string.as_bytes()) {
-    Ok(_) => Ok(()),
-    Err(e) => Err(Box::new(e))?,
-  }
+pub fn try_load_config() -> ExperimentConfig {
+    match load_config() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("error loading config: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub fn save_config(config: &ExperimentConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let path = get_config_path()?;
+
+    let toml_string = toml::to_string(&config).expect("couldn't serialize config");
+    let mut file = File::create(path)?;
+
+    match file.write_all(toml_string.as_bytes()) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(Box::new(e))?,
+    }
 }
