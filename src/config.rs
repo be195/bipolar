@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use std::{fs::File, io::{Read, Write}, collections::HashMap};
+use std::{collections::HashMap, fs::File, io::{Read, Write}, path::PathBuf};
 use git2::Repository;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -13,42 +13,61 @@ pub struct ExperimentConfig {
     // if we have multiple servers, we can configure each instance of
     // bipolar to have a minimum and maximum number of shards, but the
     // shard count is always the same for all instances
-    pub shard_count: u16,
-    pub minmax: (u8, u8),
+    pub shard_count: usize,
+    pub minmax: (usize, usize),
 }
 
-// for web apps. assigned on runtime by using client IP address
 #[derive(Debug, Deserialize, Serialize)]
-pub struct ProxyAssignment {}
+pub struct DefaultStrategy {}
 
 // assigned on build time
 #[derive(Debug, Deserialize, Serialize)]
-pub struct RandomAssignment {
+pub struct RandomStrategy {
     pub seed: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub enum AssignmentType {
-    Proxy(ProxyAssignment),
-    Random(RandomAssignment),
+pub enum StrategyType {
+    Proxy(DefaultStrategy),
+    Random(RandomStrategy),
+}
+
+impl StrategyType {
+    pub fn clone(&self) -> StrategyType {
+        match self {
+            StrategyType::Proxy(_) => StrategyType::Proxy(DefaultStrategy {}),
+            StrategyType::Random(random) => StrategyType::Random(RandomStrategy {
+                seed: random.seed,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Assignment {
     pub split: HashMap<String, u8>,
-    pub conf: AssignmentType,
+    pub strategy: StrategyType,
+}
+
+impl Assignment {
+    pub fn clone(&self) -> Assignment {
+        Assignment {
+            split: self.split.clone(),
+            strategy: self.strategy.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BranchTreatment {
     pub name: String,
-    pub ref_field: String,
+    pub ref_: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CommitTreatment {
     pub name: String,
-    pub commit: String,
+    pub ref_: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -68,11 +87,16 @@ pub enum Treatment {
 
 const CONFIG_FILE: &str = "bipolar.toml";
 
-pub fn get_config_path() -> Result<String, Box<dyn std::error::Error>> {
+pub fn get_base() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let repo = Repository::discover(".")?;
 
     let mut path = repo.path().to_path_buf();
     path.pop();
+    Ok(path)
+}
+
+pub fn get_config_path() -> Result<String, Box<dyn std::error::Error>> {
+    let mut path = get_base()?;
     path.push(CONFIG_FILE);
 
     Ok(path.to_str().unwrap_or("unknown").to_string())
@@ -108,7 +132,7 @@ pub fn init_config(name: Option<String>) -> Result<(), Box<dyn std::error::Error
         treatments: vec![],
         assignment: Assignment {
             split: HashMap::new(),
-            conf: AssignmentType::Random(RandomAssignment { seed: 0 }),
+            strategy: StrategyType::Random(RandomStrategy { seed: 0 }),
         },
         shard_count: 1,
         minmax: (0, 0),
