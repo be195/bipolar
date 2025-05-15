@@ -33,7 +33,7 @@ pub fn get_manifest_path() -> Result<String, Box<dyn std::error::Error>> {
     Ok(path.to_str().unwrap_or("unknown").to_string())
 }
 
-pub fn compare_manifest(
+fn compare_manifest(
     manifest: &Manifest,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let path = get_manifest_path()?;
@@ -54,7 +54,7 @@ pub fn compare_manifest(
     Ok(false) // TODO: this is going to be always nuclear lol
 }
 
-pub fn form_manifest(config: &config::ExperimentConfig) -> Manifest {
+fn form_manifest(config: &config::ExperimentConfig) -> Manifest {
     return Manifest {
         assignment: config.assignment.clone(),
         shard_count: config.shard_count,
