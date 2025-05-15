@@ -20,8 +20,8 @@ enum Commands {
     },
     FooBar,
     Build {
-        #[arg()]
-        nuclear: Option<bool>,
+        #[arg(short, long)]
+        nuclear: bool,
     }
 }
 

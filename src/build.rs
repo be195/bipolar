@@ -2,11 +2,12 @@ use git2::{build::CheckoutBuilder, ObjectType, Oid, Repository};
 use rand::{seq::SliceRandom, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Serialize, Deserialize};
-use std::{collections::HashMap, fs::File, io::Read, path::{Path, PathBuf}, process::Command};
+use std::{collections::HashMap, fs::File, io::{Read, Write}, path::{Path, PathBuf}, process::Command};
 use crate::config;
 use crate::utils;
 
-const MANIFEST_FILE: &str = "manifest.toml";
+const CONTROL_REPO_DIR : &str = ".control";
+const LOCKFILE_FILE: &str = "lockfile.toml";
 
 pub fn get_build_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut base = config::get_base()?;
@@ -20,52 +21,97 @@ pub fn get_build_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct Manifest {
+pub struct LockFile {
     pub assignment: config::Assignment,
+    pub base: String,
+    pub repo: String,
     pub shard_count: usize,
     pub minmax: (usize, usize),
 }
 
-pub fn get_manifest_path() -> Result<String, Box<dyn std::error::Error>> {
+impl LockFile {
+    fn eq(&self, lockfile: &LockFile) -> bool {
+        self.base == lockfile.base
+            && self.repo == lockfile.repo
+            && self.shard_count == lockfile.shard_count
+            && self.minmax == lockfile.minmax
+            && self.assignment.split.iter().all(|(k, v)| lockfile.assignment.split.get(k).map_or(false, |bv| bv >= v))
+            && match (&self.assignment.strategy, &lockfile.assignment.strategy) {
+                (config::StrategyType::Random(r1), config::StrategyType::Random(r2)) => r1.seed == r2.seed,
+                _ => false,
+            }
+    }
+}
+
+pub fn get_lockfile_path() -> Result<String, Box<dyn std::error::Error>> {
     let mut path = get_build_dir()?;
-    path.push(MANIFEST_FILE);
+    path.push(LOCKFILE_FILE);
 
     Ok(path.to_str().unwrap_or("unknown").to_string())
 }
 
-fn compare_manifest(
-    manifest: &Manifest,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let path = get_manifest_path()?;
+fn compare_lockfile(
+    lockfile: &LockFile,
+) -> Result<LockFile, Box<dyn std::error::Error>> {
+    let path = get_lockfile_path()?;
     let mut file = File::open(path)?;
 
     let mut contents = String::new();
     let _ = file.read_to_string(&mut contents);
-    let current_manifest: Manifest = toml::from_str(&contents)?;
+    let current_lockfile: LockFile = toml::from_str(&contents)?;
 
-    if current_manifest.shard_count != manifest.shard_count {
-        return Ok(false);
+    if current_lockfile.eq(lockfile) {
+        return Ok(current_lockfile);
     }
 
-    if current_manifest.minmax != manifest.minmax {
-        return Ok(false);
-    }
-
-    Ok(false) // TODO: this is going to be always nuclear lol
+    Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "not equal")))
 }
 
-fn form_manifest(config: &config::ExperimentConfig) -> Manifest {
-    return Manifest {
+fn form_lockfile(config: &config::ExperimentConfig) -> LockFile {
+    return LockFile {
         assignment: config.assignment.clone(),
+        base: config.base.clone(),
+        repo: config.repo.clone(),
         shard_count: config.shard_count,
         minmax: config.minmax,
     };
 }
 
+fn write_lockfile(lockfile: &LockFile) -> Result<(), Box<dyn std::error::Error>> {
+    let path = get_lockfile_path()?;
+    let mut file = File::create(path)?;
+
+    let contents = toml::to_string(&lockfile).expect("couldn't save lockfile, wtf");
+
+    match file.write_all(contents.as_bytes()) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(Box::new(e))?,
+    }
+}
+
+fn populate_shard_repos(
+    config: &config::ExperimentConfig,
+    path: &Path,
+    control_repo_path: &Path,
+) -> Result<HashMap<usize, Repository>, Box<dyn std::error::Error>> {
+    let mut storage = HashMap::new();
+
+    for i in config.minmax.0..config.minmax.1 {
+        let shard_path = path.join(format!("shard_{}", i));
+        if !shard_path.exists() {
+            utils::copy_dir_recursive(&control_repo_path, &shard_path)?;
+        }
+        let repo = Repository::open(&shard_path)?;
+        storage.insert(i, repo);
+    }
+
+    Ok(storage)
+}
+
 pub fn clone_control_repo(config: &config::ExperimentConfig, path: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
     println!("cloning control repo from {}", config.repo);
 
-    let control_repo_path = path.join(".control");
+    let control_repo_path = path.join(CONTROL_REPO_DIR);
     let control_repo = Repository::clone(
         &config.repo,
         &control_repo_path,
@@ -152,52 +198,40 @@ fn shuffled_shards(
     shard_ids
 }
 
-pub fn build(config: &config::ExperimentConfig, nuclear: Option<bool>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn build(config: &config::ExperimentConfig, nuclear: bool) -> Result<(), Box<dyn std::error::Error>> {
     let path = get_build_dir()?;
-    let manifest = form_manifest(config);
+    let mut lockfile = form_lockfile(config);
 
-    if compare_manifest(&manifest).unwrap_or(false) && !nuclear.unwrap_or(false) {
-        println!("manifest is up to date, skipping build"); // TODO:
-        return Ok(());
+    let control_repo_path = path.join(CONTROL_REPO_DIR);
+
+    let mut nuke = nuclear;
+    match compare_lockfile(&lockfile) {
+        Ok(current_lockfile) => lockfile = current_lockfile,
+        Err(_) => nuke = true,
     }
 
-    println!("NUKING EVERYTHING");
-    std::fs::remove_dir_all(&path)?;
+    if nuke {
+        println!("☢️ nuclear build triggered");
 
-    let control_repo_path = clone_control_repo(config, &path)?;
-
-    let mut storage = HashMap::new();
-    for i in config.minmax.0..config.minmax.1 {
-        let shard_path = path.join(format!("shard_{}", i));
-
-        println!("copying control to {}", shard_path.display());
-
-        utils::copy_dir_recursive(&control_repo_path, &shard_path)?;
-
-        let shard_repo = Repository::open(&shard_path)?;
-        storage.insert(i, shard_repo);
+        std::fs::remove_dir_all(&path)?;
+        clone_control_repo(config, &path)?;
     }
+
+    let storage = populate_shard_repos(config, &path, &control_repo_path)?;
 
     for treatment in &config.treatments {
-        let mut name = "";
+        let name = match treatment {
+            config::Treatment::Branch(t) => &t.name,
+            config::Treatment::Commit(t) => &t.name,
+            config::Treatment::Patch(t) => &t.name,
+        };
 
-        match treatment {
-            config::Treatment::Branch(branch_treatment) =>
-                name = &branch_treatment.name,
-            config::Treatment::Commit(commit_treatment) =>
-                name = &commit_treatment.name,
-            config::Treatment::Patch(patch_treatment) =>
-                name = &patch_treatment.name,
-        }
-
-        // get shard ids incrementally
-        let mut shard_ids = (config.minmax.0..config.minmax.1).collect();
-
-        match &config.assignment.strategy {
+        let shard_ids = match &config.assignment.strategy {
             config::StrategyType::Random(random) =>
-                shard_ids = shuffled_shards(&random.seed, name, config.minmax.0, config.minmax.1),
-            _ => panic!("not a random assignment"),
-        }
+                shuffled_shards(&random.seed, name, config.minmax.0, config.minmax.1),
+
+            _ => (config.minmax.0..config.minmax.1).collect(),
+        };
 
         let mut split = 0;
         if let Some(s) = config.assignment.split.get(name) {
@@ -218,6 +252,8 @@ pub fn build(config: &config::ExperimentConfig, nuclear: Option<bool>) -> Result
             apply_treatment(&shard_repo, treatment, &path)?;
         }
     }
+
+    write_lockfile(&lockfile)?;
 
     Ok(())
 }
