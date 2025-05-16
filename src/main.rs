@@ -18,7 +18,7 @@ enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
-    FooBar,
+
     Build {
         #[arg(short, long)]
         nuclear: bool,
@@ -35,10 +35,7 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Commands::FooBar => {
-            let config = config::try_load_config();
-            println!("config loaded: {:?}", config);
-        },
+
         Commands::Build { nuclear } => {
             let config = config::try_load_config();
             if let Err(e) = build::build(&config, nuclear) {

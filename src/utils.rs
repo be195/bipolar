@@ -1,6 +1,8 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::process::Command;
+use std::process::ExitStatus;
 
 pub fn copy_dir_recursive(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
     let src = src.as_ref();
@@ -25,4 +27,26 @@ pub fn copy_dir_recursive(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::R
     }
 
     Ok(())
+}
+
+pub fn run_command_string(cmd_str: &str, working_dir: &str) -> ExitStatus {
+    #[cfg(unix)]
+    let mut command = {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c");
+        cmd
+    };
+
+    #[cfg(windows)]
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C");
+        cmd
+    };
+
+    command
+        .arg(cmd_str)
+        .current_dir(working_dir)
+        .status()
+        .expect("failed to execute command")
 }

@@ -1,24 +1,17 @@
 use git2::{build::CheckoutBuilder, ObjectType, Oid, Repository};
+use handlebars::{handlebars_helper, Handlebars};
 use rand::{seq::SliceRandom, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Serialize, Deserialize};
-use std::{collections::HashMap, fs::File, io::{Read, Write}, path::{Path, PathBuf}, process::Command};
-use crate::config;
-use crate::utils;
+use std::{collections::HashMap, fs, io::{Read, Write}, path::{Path, PathBuf}, process::Command};
+use crate::{config, utils};
+use walkdir::WalkDir;
+
+handlebars_helper!(shard_prev: |x: usize| x - 1);
+handlebars_helper!(shard_next: |x: usize| x + 1);
 
 const CONTROL_REPO_DIR : &str = ".control";
 const LOCKFILE_FILE: &str = "lockfile.toml";
-
-pub fn get_build_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut base = config::get_base()?;
-    base.push(".bipolar");
-
-    if !base.exists() {
-        std::fs::create_dir_all(&base)?;
-    }
-
-    Ok(base)
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct LockFile {
@@ -27,6 +20,7 @@ pub struct LockFile {
     pub repo: String,
     pub shard_count: usize,
     pub minmax: (usize, usize),
+    pub applied: HashMap<String, Vec<usize>>,
 }
 
 impl LockFile {
@@ -43,6 +37,17 @@ impl LockFile {
     }
 }
 
+pub fn get_build_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut base = config::get_base()?;
+    base.push(".bipolar");
+
+    if !base.exists() {
+        std::fs::create_dir_all(&base)?;
+    }
+
+    Ok(base)
+}
+
 pub fn get_lockfile_path() -> Result<String, Box<dyn std::error::Error>> {
     let mut path = get_build_dir()?;
     path.push(LOCKFILE_FILE);
@@ -54,7 +59,7 @@ fn compare_lockfile(
     lockfile: &LockFile,
 ) -> Result<LockFile, Box<dyn std::error::Error>> {
     let path = get_lockfile_path()?;
-    let mut file = File::open(path)?;
+    let mut file = fs::File::open(path)?;
 
     let mut contents = String::new();
     let _ = file.read_to_string(&mut contents);
@@ -74,12 +79,13 @@ fn form_lockfile(config: &config::ExperimentConfig) -> LockFile {
         repo: config.repo.clone(),
         shard_count: config.shard_count,
         minmax: config.minmax,
+        applied: HashMap::new(),
     };
 }
 
 fn write_lockfile(lockfile: &LockFile) -> Result<(), Box<dyn std::error::Error>> {
     let path = get_lockfile_path()?;
-    let mut file = File::create(path)?;
+    let mut file = fs::File::create(path)?;
 
     let contents = toml::to_string(&lockfile).expect("couldn't save lockfile, wtf");
 
@@ -126,7 +132,66 @@ pub fn clone_control_repo(config: &config::ExperimentConfig, path: &PathBuf) -> 
         None => control_repo.set_head_detached(object.id())
     }?;
 
+    if config.hooks.control_build.is_some() {
+        println!("🔨 building control repo");
+        utils::run_command_string(
+            &config.hooks.control_build.as_ref().unwrap(),
+            control_repo_path.to_str().unwrap_or("unknown"),
+        );
+    }
+
     Ok(control_repo_path)
+}
+
+fn merge_commit_into(repo: &Repository, commit: &git2::Commit) -> Result<(), Box<dyn std::error::Error>> {
+    let head_commit = repo.head()?.peel_to_commit()?;
+    let ancestor = repo.merge_base(head_commit.id(), commit.id())?;
+    let ancestor_commit = repo.find_commit(ancestor)?;
+
+    let head_tree = head_commit.tree()?;
+    let commit_tree = commit.tree()?;
+    let ancestor_tree = ancestor_commit.tree()?;
+
+    let mut index = repo.merge_trees(&ancestor_tree, &head_tree, &commit_tree, None)?;
+
+    if index.has_conflicts() {
+        println!("😵‍💫 merge conflict detected");
+
+        let conflicts: Vec<_> = index.conflicts()?.collect::<Result<_, _>>()?;
+
+        for conflict in conflicts {
+            if let Some(ours) = conflict.our {
+                println!("‼️ using our version of {:?}", ours.path);
+                index.add(&ours)?;
+            } else if let Some(theirs) = conflict.their {
+                println!("‼️ using their version of {:?}", theirs.path);
+                index.add(&theirs)?;
+            }
+        }
+
+        index.write()?;
+    }
+
+    let tree_oid = index.write_tree_to(repo)?;
+    let tree = repo.find_tree(tree_oid)?;
+
+    let sig = repo.signature()?;
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "bipolar: auto-merge treatment",
+        &tree,
+        &[&head_commit, &commit],
+    )?;
+
+    let mut checkout = CheckoutBuilder::new();
+    checkout.force();
+
+    repo.checkout_tree(tree.as_object(), Some(&mut checkout))?;
+    repo.set_head("HEAD")?;
+
+    Ok(())
 }
 
 pub fn apply_treatment(
@@ -140,32 +205,29 @@ pub fn apply_treatment(
             let reference = shard_repo.find_reference(&format!("refs/remotes/origin/{branch}"))?;
             let object = reference.peel(ObjectType::Commit)?;
             let commit = object.into_commit().map_err(|_| "Not a commit")?;
-            let tree = commit.tree()?;
 
-            let mut checkout = CheckoutBuilder::new();
-            checkout.force().target_dir(target_dir);
-            shard_repo.checkout_tree(tree.as_object(), Some(&mut checkout))?;
+            merge_commit_into(shard_repo, &commit)?;
         }
+
         config::Treatment::Commit(commit_treatment) => {
             let oid = Oid::from_str(&commit_treatment.ref_)?;
             let commit = shard_repo.find_commit(oid)?;
-            let tree = commit.tree()?;
 
-            let mut checkout = CheckoutBuilder::new();
-            checkout.force().target_dir(target_dir);
-            shard_repo.checkout_tree(tree.as_object(), Some(&mut checkout))?;
+            merge_commit_into(shard_repo, &commit)?;
         }
+
         config::Treatment::Patch(patch_treatment) => {
             let patch_path = &patch_treatment.patch;
             let status = Command::new("git")
                 .arg("apply")
+                .arg("--whitespace=fix")
                 .arg("--directory")
                 .arg(target_dir)
                 .arg(patch_path)
                 .status()?;
 
             if !status.success() {
-                return Err("failed to apply patch".into());
+                return Err(format!("failed to apply patch: {:?}", patch_path).into());
             }
         }
     }
@@ -196,6 +258,63 @@ fn shuffled_shards(
     shard_ids.shuffle(&mut rng);
 
     shard_ids
+}
+
+fn get_home_dir(repo: &Repository) -> PathBuf{
+    let mut path = repo.path().to_path_buf();
+    path.pop();
+    path
+}
+
+#[derive(Serialize, Deserialize)]
+struct Template {
+    shard: usize,
+    shard_count: usize,
+    custom: HashMap<String, String>,
+}
+
+fn template_fill(shard: usize, config: &config::ExperimentConfig, shard_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let template_config = config.templating.as_ref().expect("template config expected, fn not meant to be called");
+
+    let context = Template {
+        shard,
+        shard_count: config.shard_count,
+        custom: template_config.config.clone(),
+    };
+
+    let mut handlebars = Handlebars::new();
+    handlebars.register_helper("prev", Box::new(shard_prev));
+    handlebars.register_helper("next", Box::new(shard_next));
+
+    let base = config::get_base()?.join(template_config.path.clone());
+    let walkdir = WalkDir::new(&base)
+        .into_iter()
+        .filter_map(Result::ok);
+
+    for entry in walkdir {
+        let path = entry.path();
+
+        if path.is_dir() {
+            continue;
+        }
+
+        let template_content = fs::read_to_string(path)?;
+        let template_name = path.strip_prefix(&base)?.to_string_lossy();
+        handlebars.register_template_string(&template_name, template_content)?;
+
+        let rendered = handlebars.render(&template_name, &context)?;
+
+        let relative_path = path.strip_prefix(&base)?;
+        let output_path = shard_dir.join(relative_path);
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(&output_path, rendered)?;
+    }
+
+    Ok(())
 }
 
 pub fn build(config: &config::ExperimentConfig, nuclear: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -242,18 +361,46 @@ pub fn build(config: &config::ExperimentConfig, nuclear: bool) -> Result<(), Box
         }
 
         let count = ((shard_ids.len() as f64) * (split as f64 / 100.0)).round() as usize;
-
-        for &i in shard_ids.iter().take(count) {
+        let iter = shard_ids.iter()
+            .take(count)
+            .skip(
+                lockfile.applied.entry(name.clone()).or_insert(vec![]).len()
+            );
+        for &i in iter {
             let shard_repo = storage.get(&i).unwrap();
-            let mut path = shard_repo.path().to_path_buf();
-            path.pop();
+            let path = get_home_dir(shard_repo);
 
             println!("💉 applying treatment {} to shard {}", name, i);
             apply_treatment(&shard_repo, treatment, &path)?;
+            lockfile.applied.entry(name.clone()).or_insert(vec![]).push(i);
         }
     }
 
+    if config.hooks.build.is_some() || config.templating.is_some() {
+        for i in config.minmax.0..config.minmax.1 {
+            let path = get_home_dir(storage.get(&i).unwrap());
+
+            if config.hooks.build.is_some() {
+                println!("🔨 building shard {}", i);
+                utils::run_command_string(
+                    &config.hooks.build.as_ref().unwrap(),
+                    path.to_str().unwrap_or("unknown"),
+                );
+            }
+
+            if config.templating.is_some() {
+                println!("📄 filling in config templates for shard {}", i);
+                template_fill(i, config, &path)?;
+            }
+        }
+    } else {
+        println!("⚠️ templating config and build hook missing!")
+    }
+
     write_lockfile(&lockfile)?;
+
+    println!("🔒 lockfile written to {}", get_lockfile_path()?);
+    println!("YOU'RE ALL CAUGHT UP :)");
 
     Ok(())
 }

@@ -2,6 +2,8 @@ use serde::{Serialize, Deserialize};
 use std::{collections::HashMap, fs::File, io::{Read, Write}, path::PathBuf};
 use git2::Repository;
 
+const CONFIG_FILE: &str = "bipolar.toml";
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ExperimentConfig {
     pub name: String,
@@ -9,12 +11,27 @@ pub struct ExperimentConfig {
     pub base: String,
     pub treatments: Vec<Treatment>,
     pub assignment: Assignment,
+    pub hooks: Hooks,
+    pub templating: Option<Templating>,
 
     // if we have multiple servers, we can configure each instance of
     // bipolar to have a minimum and maximum number of shards, but the
     // shard count is always the same for all instances
     pub shard_count: usize,
     pub minmax: (usize, usize),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Templating {
+    pub path: String,
+    pub config: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Hooks {
+    pub control_build: Option<String>,
+    pub build: Option<String>,
+    pub run: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -74,7 +91,6 @@ pub struct CommitTreatment {
 pub struct PatchTreatment {
     pub name: String,
     pub patch: String,
-    pub base: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -84,8 +100,6 @@ pub enum Treatment {
     Commit(CommitTreatment),
     Patch(PatchTreatment),
 }
-
-const CONFIG_FILE: &str = "bipolar.toml";
 
 pub fn get_base() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let repo = Repository::discover(".")?;
@@ -129,6 +143,12 @@ pub fn init_config(name: Option<String>) -> Result<(), Box<dyn std::error::Error
         name: name.unwrap_or(repo_name),
         repo: url.to_string(),
         base,
+        hooks: Hooks {
+            control_build: None,
+            build: None,
+            run: None,
+        },
+        templating: None,
         treatments: vec![],
         assignment: Assignment {
             split: HashMap::new(),
