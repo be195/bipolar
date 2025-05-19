@@ -1,17 +1,15 @@
 use git2::{build::CheckoutBuilder, ObjectType, Oid, Repository};
-use handlebars::{handlebars_helper, Handlebars};
 use rand::{seq::SliceRandom, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Serialize, Deserialize};
+use tera::{Tera, Context};
 use std::{collections::HashMap, fs, io::{Read, Write}, path::{Path, PathBuf}, process::Command};
 use crate::{config, utils};
 use walkdir::WalkDir;
 
-handlebars_helper!(shard_prev: |x: usize| x - 1);
-handlebars_helper!(shard_next: |x: usize| x + 1);
-
-const CONTROL_REPO_DIR : &str = ".control";
-const LOCKFILE_FILE: &str = "lockfile.toml";
+pub const CONTROL_REPO_DIR : &str = ".control";
+pub const LOCKFILE_FILE: &str = "lockfile.toml";
+pub const BUILD_DIR: &str = ".bipolar";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct LockFile {
@@ -39,7 +37,7 @@ impl LockFile {
 
 pub fn get_build_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut base = config::get_base()?;
-    base.push(".bipolar");
+    base.push(BUILD_DIR);
 
     if !base.exists() {
         std::fs::create_dir_all(&base)?;
@@ -95,15 +93,21 @@ fn write_lockfile(lockfile: &LockFile) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
+pub fn get_shard_dir(shard: usize) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut path = get_build_dir()?;
+    path.push(format!("shard_{}", shard));
+
+    Ok(path)
+}
+
 fn populate_shard_repos(
     config: &config::ExperimentConfig,
-    path: &Path,
     control_repo_path: &Path,
 ) -> Result<HashMap<usize, Repository>, Box<dyn std::error::Error>> {
     let mut storage = HashMap::new();
 
     for i in config.minmax.0..config.minmax.1 {
-        let shard_path = path.join(format!("shard_{}", i));
+        let shard_path = get_shard_dir(i)?;
         if !shard_path.exists() {
             utils::copy_dir_recursive(&control_repo_path, &shard_path)?;
         }
@@ -136,8 +140,9 @@ pub fn clone_control_repo(config: &config::ExperimentConfig, path: &PathBuf) -> 
         println!("🔨 building control repo");
         utils::run_command_string(
             &config.hooks.control_build.as_ref().unwrap(),
-            control_repo_path.to_str().unwrap_or("unknown"),
-        );
+            control_repo_path.to_str().expect("couldn't get control repo path, wtf"),
+            false,
+        )?;
     }
 
     Ok(control_repo_path)
@@ -276,33 +281,26 @@ struct Template {
 fn template_fill(shard: usize, config: &config::ExperimentConfig, shard_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let template_config = config.templating.as_ref().expect("template config expected, fn not meant to be called");
 
-    let context = Template {
-        shard,
-        shard_count: config.shard_count,
-        custom: template_config.config.clone(),
-    };
-
-    let mut handlebars = Handlebars::new();
-    handlebars.register_helper("prev", Box::new(shard_prev));
-    handlebars.register_helper("next", Box::new(shard_next));
+    let mut context = Context::new();
+    // TODO: port?
+    context.insert("shard", &shard);
+    context.insert("shard_count", &config.shard_count);
+    context.insert("custom", &template_config.config);
 
     let base = config::get_base()?.join(template_config.path.clone());
-    let walkdir = WalkDir::new(&base)
-        .into_iter()
-        .filter_map(Result::ok);
+    let mut tera = Tera::new(&format!("{}/**/*", base.to_str().expect("wtf")))?;
 
-    for entry in walkdir {
+    for entry in WalkDir::new(&base) {
+        let entry = entry.unwrap();
         let path = entry.path();
 
-        if path.is_dir() {
+        if path.is_dir() || path.file_name().unwrap().to_str().unwrap().starts_with(".") {
             continue;
         }
 
         let template_content = fs::read_to_string(path)?;
-        let template_name = path.strip_prefix(&base)?.to_string_lossy();
-        handlebars.register_template_string(&template_name, template_content)?;
 
-        let rendered = handlebars.render(&template_name, &context)?;
+        let rendered = tera.render_str(&template_content, &context)?;
 
         let relative_path = path.strip_prefix(&base)?;
         let output_path = shard_dir.join(relative_path);
@@ -336,7 +334,7 @@ pub fn build(config: &config::ExperimentConfig, nuclear: bool) -> Result<(), Box
         clone_control_repo(config, &path)?;
     }
 
-    let storage = populate_shard_repos(config, &path, &control_repo_path)?;
+    let storage = populate_shard_repos(config, &control_repo_path)?;
 
     for treatment in &config.treatments {
         let name = match treatment {
@@ -347,7 +345,7 @@ pub fn build(config: &config::ExperimentConfig, nuclear: bool) -> Result<(), Box
 
         let shard_ids = match &config.assignment.strategy {
             config::StrategyType::Random(random) =>
-                shuffled_shards(&random.seed, name, config.minmax.0, config.minmax.1),
+                shuffled_shards(&random.seed, name, 0, config.shard_count),
 
             _ => (config.minmax.0..config.minmax.1).collect(),
         };
@@ -367,6 +365,10 @@ pub fn build(config: &config::ExperimentConfig, nuclear: bool) -> Result<(), Box
                 lockfile.applied.entry(name.clone()).or_insert(vec![]).len()
             );
         for &i in iter {
+            if i < config.minmax.0 || i >= config.minmax.1 {
+                continue;
+            }
+
             let shard_repo = storage.get(&i).unwrap();
             let path = get_home_dir(shard_repo);
 
@@ -385,7 +387,8 @@ pub fn build(config: &config::ExperimentConfig, nuclear: bool) -> Result<(), Box
                 utils::run_command_string(
                     &config.hooks.build.as_ref().unwrap(),
                     path.to_str().unwrap_or("unknown"),
-                );
+                    false,
+                )?;
             }
 
             if config.templating.is_some() {

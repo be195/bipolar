@@ -1,4 +1,5 @@
-/target
+# bipolar files
 bipolar.toml
-.bipolar/
+.bipolar
+target/
 templates/

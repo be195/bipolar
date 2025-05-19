@@ -1,6 +1,7 @@
 use serde::{Serialize, Deserialize};
-use std::{collections::HashMap, fs::File, io::{Read, Write}, path::PathBuf};
+use std::{collections::HashMap, fs::{File, OpenOptions}, io::{Read, Write}, path::PathBuf};
 use git2::Repository;
+use crate::build;
 
 const CONFIG_FILE: &str = "bipolar.toml";
 
@@ -162,6 +163,35 @@ pub fn init_config(name: Option<String>) -> Result<(), Box<dyn std::error::Error
         Ok(_) => Ok(()),
         Err(e) => Err(format!("couldn't save config: {}", e))?,
     }
+}
+
+const COMMENT: &str = "# bipolar files";
+pub fn add_self_to_gitignore() -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::Path::new(".gitignore");
+    let mut contents = String::new();
+
+    if path.exists() {
+        let mut file = File::open(path)?;
+        file.read_to_string(&mut contents)?;
+    }
+
+    if !contents.contains(COMMENT) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(path)?;
+
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+
+        file.write_all(format!("{}\n", COMMENT).as_bytes())?;
+        file.write_all(format!("{}\n", CONFIG_FILE).as_bytes())?;
+        file.write_all(format!("{}\n", build::BUILD_DIR).as_bytes())?;
+    }
+
+    Ok(())
 }
 
 pub fn try_load_config() -> ExperimentConfig {

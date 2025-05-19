@@ -1,5 +1,6 @@
 mod config;
 mod build;
+mod runner;
 mod utils;
 
 use clap::{Parser, Subcommand};
@@ -22,7 +23,9 @@ enum Commands {
     Build {
         #[arg(short, long)]
         nuclear: bool,
-    }
+    },
+
+    Run,
 }
 
 fn main() {
@@ -34,12 +37,25 @@ fn main() {
                 eprintln!("error initializing config: {}", e);
                 std::process::exit(1);
             }
+
+            if let Err(e) = config::add_self_to_gitignore() {
+                eprintln!("error adding self to .gitignore: {}", e);
+                std::process::exit(1);
+            }
         },
 
         Commands::Build { nuclear } => {
             let config = config::try_load_config();
             if let Err(e) = build::build(&config, nuclear) {
                 eprintln!("error building: {}", e);
+                std::process::exit(1);
+            }
+        },
+
+        Commands::Run => {
+            let config = config::try_load_config();
+            if let Err(e) = runner::run(&config) {
+                eprintln!("error running: {}", e);
                 std::process::exit(1);
             }
         },
