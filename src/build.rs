@@ -378,7 +378,7 @@ pub fn build(config: &config::ExperimentConfig, nuclear: bool) -> Result<(), Box
         }
     }
 
-    if config.hooks.build.is_some() || config.templating.is_some() {
+    if config.hooks.build.is_some() || config.templating.is_some() || config.symlinks.is_some() {
         for i in config.minmax.0..config.minmax.1 {
             let path = get_home_dir(storage.get(&i).unwrap());
 
@@ -394,6 +394,19 @@ pub fn build(config: &config::ExperimentConfig, nuclear: bool) -> Result<(), Box
             if config.templating.is_some() {
                 println!("📄 filling in config templates for shard {}", i);
                 template_fill(i, config, &path)?;
+            }
+
+            if let Some(symlinks) = &config.symlinks {
+                for symlink in symlinks {
+                    let path = get_home_dir(storage.get(&i).unwrap());
+                    let symlink_path = path.join(symlink);
+
+                    let default_base = "symlinks/".to_string();
+                    let base = config.symlinks_base.as_ref().unwrap_or(&default_base);
+                    let original_path = config::get_base()?.join(base).join(symlink);
+
+                    utils::create_symlink_force(&original_path.to_str().unwrap(), &symlink_path.to_str().unwrap())?;
+                }
             }
         }
     } else {

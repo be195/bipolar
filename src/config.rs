@@ -14,6 +14,9 @@ pub struct ExperimentConfig {
     pub assignment: Assignment,
     pub hooks: Hooks,
     pub templating: Option<Templating>,
+    pub symlinks: Option<Vec<String>>,
+    pub symlinks_base: Option<String>,
+    pub environment: Option<HashMap<String, String>>,
 
     // if we have multiple servers, we can configure each instance of
     // bipolar to have a minimum and maximum number of shards, but the
@@ -155,6 +158,9 @@ pub fn init_config(name: Option<String>) -> Result<(), Box<dyn std::error::Error
             split: HashMap::new(),
             strategy: StrategyType::Random(RandomStrategy { seed: 0 }),
         },
+        symlinks: None,
+        symlinks_base: None,
+        environment: None,
         shard_count: 1,
         minmax: (0, 0),
     };

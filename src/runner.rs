@@ -6,6 +6,12 @@ pub fn run(config: &config::ExperimentConfig) -> Result<(), Box<dyn std::error::
         return Err("no run hook found".into());
     }
 
+    if let Some(environment) = &config.environment {
+        for (key, value) in environment {
+            std::env::set_var(key, value);
+        }
+    }
+
     let mut children = Vec::new();
 
     for shard in config.minmax.0..config.minmax.1 {
@@ -16,6 +22,8 @@ pub fn run(config: &config::ExperimentConfig) -> Result<(), Box<dyn std::error::
             println!("running for shard {}", shard);
             let child = utils::run_command_string(&hook, &shard_dir.to_str().unwrap(), true)?;
             children.push(child);
+
+            thread::sleep(Duration::from_millis(500));
         }
     }
 

@@ -56,3 +56,28 @@ pub fn run_command_string(cmd_str: &str, working_dir: &str, asynch: bool) -> Res
         Ok(child)
     }
 }
+
+pub fn create_dir_symlink(original: &str, link: &str) -> io::Result<()> {
+    let original_path = Path::new(original);
+    let link_path = Path::new(link);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(original_path, link_path)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::symlink_dir;
+        symlink_dir(original_path, link_path)
+    }
+}
+
+pub fn create_symlink_force(original: &str, link: &str) -> io::Result<()> {
+    if Path::new(link).exists() {
+        fs::remove_dir_all(link)?;
+    }
+
+    create_dir_symlink(original, link)
+}
